@@ -1,6 +1,7 @@
 name: Dashboard image
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - "master"
@@ -62,7 +63,7 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64,linux/arm,linux/386
+          platforms: linux/amd64,linux/arm64,linux/arm,linux/386,linux/s390x
           push: true
           tags: |
             ${{ steps.image-name.outputs.ALI_IMAGE_NAME }}
@@ -80,3 +81,10 @@ jobs:
           curl -s https://purge.jsdelivr.net/gh/$LOWER_USERNAME/probe@master/script/probe-agent.service
           curl -s https://purge.jsdelivr.net/gh/$LOWER_USERNAME/probe@master/script/docker-compose.yaml
           curl -s https://purge.jsdelivr.net/gh/$LOWER_USERNAME/probe@master/script/config.yaml
+          curl -s https://purge.jsdelivr.net/gh/xos/probe@master/resource/static/bg/background.jpeg
+          curl -s https://purge.jsdelivr.net/gh/xos/probe@master/resource/static/favicon.ico
+          curl -s https://purge.jsdelivr.net/gh/xos/probe@master/resource/static/logo.png
+          curl -s https://purge.jsdelivr.net/gh/xos/probe@master/resource/static/main.css
+          curl -s https://purge.jsdelivr.net/gh/xos/probe@master/resource/static/main.js
+          curl -s https://purge.jsdelivr.net/gh/xos/probe@master/resource/static/semantic-ui-alerts.min.css
+          curl -s https://purge.jsdelivr.net/gh/xos/probe@master/resource/static/semantic-ui-alerts.min.js

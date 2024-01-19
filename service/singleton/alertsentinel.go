@@ -6,6 +6,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jinzhu/copier"
+	"github.com/nicksnyder/go-i18n/v2/i18n"
+
 	"github.com/xos/probe/model"
 )
 
@@ -21,12 +24,15 @@ type NotificationHistory struct {
 }
 
 // 报警规则
-var AlertsLock sync.RWMutex
-var Alerts []*model.AlertRule
-var alertsStore map[uint64]map[uint64][][]interface{}
-var alertsPrevState map[uint64]map[uint64]uint
-var AlertsCycleTransferStatsStore map[uint64]*model.CycleTransferStats
+var (
+	AlertsLock                    sync.RWMutex
+	Alerts                        []*model.AlertRule
+	alertsStore                   map[uint64]map[uint64][][]interface{} // [alert_id][server_id] -> 对应报警规则的检查结果
+	alertsPrevState               map[uint64]map[uint64]uint            // [alert_id][server_id] -> 对应报警规则的上一次报警状态
+	AlertsCycleTransferStatsStore map[uint64]*model.CycleTransferStats  // [alert_id] -> 对应报警规则的周期流量统计
+)
 
+// addCycleTransferStatsInfo 向AlertsCycleTransferStatsStore中添加周期流量报警统计信息
 func addCycleTransferStatsInfo(alert *model.AlertRule) {
 	if !alert.Enabled() {
 		return
@@ -52,6 +58,7 @@ func addCycleTransferStatsInfo(alert *model.AlertRule) {
 	}
 }
 
+// AlertSentinelStart 报警器启动
 func AlertSentinelStart() {
 	alertsStore = make(map[uint64]map[uint64][][]interface{})
 	alertsPrevState = make(map[uint64]map[uint64]uint)
@@ -60,10 +67,15 @@ func AlertSentinelStart() {
 	if err := DB.Find(&Alerts).Error; err != nil {
 		panic(err)
 	}
-	for i := 0; i < len(Alerts); i++ {
-		alertsStore[Alerts[i].ID] = make(map[uint64][][]interface{})
-		alertsPrevState[Alerts[i].ID] = make(map[uint64]uint)
-		addCycleTransferStatsInfo(Alerts[i])
+	for _, alert := range Alerts {
+		// 旧版本可能不存在通知组 为其添加默认值
+		if alert.NotificationTag == "" {
+			alert.NotificationTag = "default"
+			DB.Save(alert)
+		}
+		alertsStore[alert.ID] = make(map[uint64][][]interface{})
+		alertsPrevState[alert.ID] = make(map[uint64]uint)
+		addCycleTransferStatsInfo(alert)
 	}
 	AlertsLock.Unlock()
 
@@ -120,6 +132,7 @@ func OnDeleteAlert(id uint64) {
 	delete(AlertsCycleTransferStatsStore, id)
 }
 
+// checkStatus 检查报警规则并发送报警
 func checkStatus() {
 	AlertsLock.RLock()
 	defer AlertsLock.RUnlock()
@@ -137,14 +150,36 @@ func checkStatus() {
 				ID][server.ID], alert.Snapshot(AlertsCycleTransferStatsStore[alert.ID], server, DB))
 			// 发送通知，分为触发报警和恢复通知
 			max, passed := alert.Check(alertsStore[alert.ID][server.ID])
+			// 保存当前服务器状态信息
+			curServer := model.Server{}
+			copier.Copy(&curServer, server)
 			if !passed {
 				alertsPrevState[alert.ID][server.ID] = _RuleCheckFail
-				message := fmt.Sprintf("#探针通知" + "\n" + "[主机异常]" + "\n" + "%s[%s]" + "\n" + "规则：%s", server.Name, IPDesensitize(server.Host.IP), alert.Name)
-				go SendNotification(message, true)
+				message := fmt.Sprintf("#%s"+"\n"+"[%s]"+"\n"+"%s[%s]"+"\n"+"%s%s",
+					Localizer.MustLocalize(&i18n.LocalizeConfig{
+						MessageID: "Notify",
+					}),
+					Localizer.MustLocalize(&i18n.LocalizeConfig{
+						MessageID: "Incident",
+					}), server.Name, IPDesensitize(server.Host.IP),
+					Localizer.MustLocalize(&i18n.LocalizeConfig{
+						MessageID: "Rule",
+					}),
+					alert.Name)
+				go SendNotification(alert.NotificationTag, message, true, &curServer)
 			} else {
 				if alertsPrevState[alert.ID][server.ID] == _RuleCheckFail {
-					message := fmt.Sprintf("#探针通知" + "\n" + "[主机恢复]" + "\n" + "%s[%s]" + "\n" + "规则：%s", server.Name, IPDesensitize(server.Host.IP), alert.Name)
-					go SendNotification(message, true)
+					message := fmt.Sprintf("#%s"+"\n"+"[%s]"+"\n"+"%s[%s]"+"\n"+"%s%s",
+						Localizer.MustLocalize(&i18n.LocalizeConfig{
+							MessageID: "Notify",
+						}),
+						Localizer.MustLocalize(&i18n.LocalizeConfig{
+							MessageID: "Resolved",
+						}), server.Name, IPDesensitize(server.Host.IP),
+						Localizer.MustLocalize(&i18n.LocalizeConfig{
+							MessageID: "Rule",
+						}), alert.Name)
+					go SendNotification(alert.NotificationTag, message, true, &curServer)
 				}
 				alertsPrevState[alert.ID][server.ID] = _RuleCheckPass
 			}

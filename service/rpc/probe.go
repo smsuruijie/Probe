@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jinzhu/copier"
+	"github.com/nicksnyder/go-i18n/v2/i18n"
+
 	"github.com/xos/probe/model"
 	pb "github.com/xos/probe/proto"
 	"github.com/xos/probe/service/singleton"
@@ -28,11 +31,62 @@ func (s *ProbeHandler) ReportTask(c context.Context, r *pb.TaskResult) (*pb.Rece
 		if cr != nil {
 			singleton.ServerLock.RLock()
 			defer singleton.ServerLock.RUnlock()
+			// 保存当前服务器状态信息
+			curServer := model.Server{}
+			copier.Copy(&curServer, singleton.ServerList[clientID])
 			if cr.PushSuccessful && r.GetSuccessful() {
-				singleton.SendNotification(fmt.Sprintf("#探针通知" + "\n" + "[任务成功]" + "\n" + "%s " + "\n" + "服务器：%s，日志：\n%s", cr.Name, singleton.ServerList[clientID].Name, r.GetData()), false)
+				singleton.SendNotification(cr.NotificationTag, fmt.Sprintf("#%s"+"\n"+"[%s]"+"\n"+"%s "+"\n"+"%s%s，%s\n%s",
+					singleton.Localizer.MustLocalize(
+						&i18n.LocalizeConfig{
+							MessageID: "Notify",
+						},
+					),
+					singleton.Localizer.MustLocalize(
+						&i18n.LocalizeConfig{
+							MessageID: "ScheduledTaskExecutedSuccessfully",
+						},
+					),
+					cr.Name,
+					singleton.Localizer.MustLocalize(
+						&i18n.LocalizeConfig{
+							MessageID: "TaskServer",
+						},
+					),
+					singleton.ServerList[clientID].Name,
+					singleton.Localizer.MustLocalize(
+						&i18n.LocalizeConfig{
+							MessageID: "TaskLog",
+						},
+					),
+					r.GetData(),
+				), false, &curServer)
 			}
 			if !r.GetSuccessful() {
-				singleton.SendNotification(fmt.Sprintf("#探针通知" + "\n" + "[任务失败]" + "\n" + "%s " + "\n" + "服务器：%s，日志：\n%s", cr.Name, singleton.ServerList[clientID].Name, r.GetData()), false)
+				singleton.SendNotification(cr.NotificationTag, fmt.Sprintf("#%s"+"\n"+"[%s]"+"\n"+"%s "+"\n"+"%s%s，%s\n%s",
+					singleton.Localizer.MustLocalize(
+						&i18n.LocalizeConfig{
+							MessageID: "Notify",
+						},
+					),
+					singleton.Localizer.MustLocalize(
+						&i18n.LocalizeConfig{
+							MessageID: "ScheduledTaskExecutedFailed",
+						},
+					),
+					cr.Name,
+					singleton.Localizer.MustLocalize(
+						&i18n.LocalizeConfig{
+							MessageID: "TaskServer",
+						},
+					),
+					singleton.ServerList[clientID].Name,
+					singleton.Localizer.MustLocalize(
+						&i18n.LocalizeConfig{
+							MessageID: "TaskLog",
+						},
+					),
+					singleton.ServerList[clientID].Name,
+					r.GetData()), false, &curServer)
 			}
 			singleton.DB.Model(cr).Updates(model.Cron{
 				LastExecutedAt: time.Now().Add(time.Second * -1 * time.Duration(r.GetDelay())),
@@ -103,9 +157,24 @@ func (s *ProbeHandler) ReportSystemInfo(c context.Context, r *pb.Host) (*pb.Rece
 		singleton.ServerList[clientID].Host.IP != "" &&
 		host.IP != "" &&
 		singleton.ServerList[clientID].Host.IP != host.IP {
-		singleton.SendNotification(fmt.Sprintf(
-			"#探针通知" + "\n" + "[IP 变更]" + "\n" + "%s " + "\n" + "旧 IP：%s" + "\n" + "新 IP：%s",
-			singleton.ServerList[clientID].Name, singleton.IPDesensitize(singleton.ServerList[clientID].Host.IP), singleton.IPDesensitize(host.IP)), true)
+		singleton.SendNotification(singleton.Conf.IPChangeNotificationTag, fmt.Sprintf(
+			"#%s"+"\n"+"[%s]"+"\n"+"%s"+"\n"+"%s %s"+"\n"+"%s %s",
+			singleton.Localizer.MustLocalize(&i18n.LocalizeConfig{
+				MessageID: "Notify",
+			}),
+			singleton.Localizer.MustLocalize(&i18n.LocalizeConfig{
+				MessageID: "IPChanged",
+			}),
+			singleton.ServerList[clientID].Name,
+			singleton.Localizer.MustLocalize(&i18n.LocalizeConfig{
+				MessageID: "OldIP",
+			}),
+			singleton.IPDesensitize(singleton.ServerList[clientID].Host.IP),
+			singleton.Localizer.MustLocalize(&i18n.LocalizeConfig{
+				MessageID: "NewIP",
+			}),
+			singleton.IPDesensitize(host.IP),
+		), true)
 	}
 
 	// 判断是否是机器重启，如果是机器重启要录入最后记录的流量里面

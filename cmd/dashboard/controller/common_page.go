@@ -1,21 +1,25 @@
 package controller
 
 import (
-	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/hashicorp/go-uuid"
+	"github.com/jinzhu/copier"
+	"github.com/nicksnyder/go-i18n/v2/i18n"
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/xos/probe/model"
 	"github.com/xos/probe/pkg/mygin"
+	"github.com/xos/probe/pkg/utils"
 	"github.com/xos/probe/proto"
 	"github.com/xos/probe/service/singleton"
 )
@@ -32,6 +36,7 @@ type commonPage struct {
 	r             *gin.Engine
 	terminals     map[string]*terminalContext
 	terminalsLock *sync.Mutex
+	requestGroup  singleflight.Group
 }
 
 func (cp *commonPage) serve() {
@@ -55,16 +60,18 @@ func (p *commonPage) issueViewPassword(c *gin.Context) {
 	err := c.ShouldBind(&vpf)
 	var hash []byte
 	if err == nil && vpf.Password != singleton.Conf.Site.ViewPassword {
-		err = errors.New("查看密码错误")
+		err = errors.New(singleton.Localizer.MustLocalize(&i18n.LocalizeConfig{MessageID: "WrongAccessPassword"}))
 	}
 	if err == nil {
 		hash, err = bcrypt.GenerateFromPassword([]byte(vpf.Password), bcrypt.DefaultCost)
 	}
 	if err != nil {
 		mygin.ShowErrorPage(c, mygin.ErrInfo{
-			Code:  http.StatusOK,
-			Title: "出现错误",
-			Msg:   fmt.Sprintf("请求错误：%s", err),
+			Code: http.StatusOK,
+			Title: singleton.Localizer.MustLocalize(&i18n.LocalizeConfig{
+				MessageID: "AnErrorEccurred",
+			}),
+			Msg: err.Error(),
 		}, true)
 		c.Abort()
 		return
@@ -87,7 +94,7 @@ func (p *commonPage) checkViewPassword(c *gin.Context) {
 	viewPassword, _ := c.Cookie(singleton.Conf.Site.CookieName + "-vp")
 	if err := bcrypt.CompareHashAndPassword([]byte(viewPassword), []byte(singleton.Conf.Site.ViewPassword)); err != nil {
 		c.HTML(http.StatusOK, "theme-"+singleton.Conf.Site.Theme+"/viewpassword", mygin.CommonEnvironment(c, gin.H{
-			"Title":      "验证查看密码",
+			"Title":      singleton.Localizer.MustLocalize(&i18n.LocalizeConfig{MessageID: "VerifyPassword"}),
 			"CustomCode": singleton.Conf.Site.CustomCode,
 		}))
 		c.Abort()
@@ -98,21 +105,54 @@ func (p *commonPage) checkViewPassword(c *gin.Context) {
 }
 
 func (p *commonPage) service(c *gin.Context) {
-	singleton.AlertsLock.RLock()
-	defer singleton.AlertsLock.RUnlock()
+	res, _, _ := p.requestGroup.Do("servicePage", func() (interface{}, error) {
+		singleton.AlertsLock.RLock()
+		defer singleton.AlertsLock.RUnlock()
+		var stats map[uint64]model.ServiceItemResponse
+		var statsStore map[uint64]model.CycleTransferStats
+		copier.Copy(&stats, singleton.ServiceSentinelShared.LoadStats())
+		copier.Copy(&statsStore, singleton.AlertsCycleTransferStatsStore)
+		return []interface {
+		}{
+			stats, statsStore,
+		}, nil
+	})
 	c.HTML(http.StatusOK, "theme-"+singleton.Conf.Site.Theme+"/service", mygin.CommonEnvironment(c, gin.H{
-		"Title":              "服务状态",
-		"Services":           singleton.ServiceSentinelShared.LoadStats(),
-		"CycleTransferStats": singleton.AlertsCycleTransferStatsStore,
+		"Title":              singleton.Localizer.MustLocalize(&i18n.LocalizeConfig{MessageID: "ServicesStatus"}),
+		"Services":           res.([]interface{})[0],
+		"CycleTransferStats": res.([]interface{})[1],
 		"CustomCode":         singleton.Conf.Site.CustomCode,
 	}))
 }
 
+func (cp *commonPage) getServerStat() ([]byte, error) {
+	v, err, _ := cp.requestGroup.Do("serverStats", func() (any, error) {
+		singleton.SortedServerLock.RLock()
+		defer singleton.SortedServerLock.RUnlock()
+		return utils.Json.Marshal(Data{
+			Now:     time.Now().Unix() * 1000,
+			Servers: singleton.SortedServerList,
+		})
+	})
+	return v.([]byte), err
+}
+
 func (cp *commonPage) home(c *gin.Context) {
-	singleton.SortedServerLock.RLock()
-	defer singleton.SortedServerLock.RUnlock()
+	stat, err := cp.getServerStat()
+	if err != nil {
+		mygin.ShowErrorPage(c, mygin.ErrInfo{
+			Code: http.StatusInternalServerError,
+			Title: singleton.Localizer.MustLocalize(&i18n.LocalizeConfig{
+				MessageID: "SystemError",
+			}),
+			Msg:  "服务器状态获取失败",
+			Link: "/",
+			Btn:  "返回首页",
+		}, true)
+		return
+	}
 	c.HTML(http.StatusOK, "theme-"+singleton.Conf.Site.Theme+"/home", mygin.CommonEnvironment(c, gin.H{
-		"Servers":    singleton.SortedServerList,
+		"Servers":    string(stat),
 		"CustomCode": singleton.Conf.Site.CustomCode,
 	}))
 }
@@ -131,24 +171,24 @@ func (cp *commonPage) ws(c *gin.Context) {
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		mygin.ShowErrorPage(c, mygin.ErrInfo{
-			Code:  http.StatusInternalServerError,
-			Title: "网络错误",
-			Msg:   "Websocket协议切换失败",
-			Link:  "/",
-			Btn:   "返回首页",
+			Code: http.StatusInternalServerError,
+			Title: singleton.Localizer.MustLocalize(&i18n.LocalizeConfig{
+				MessageID: "NetworkError",
+			}),
+			Msg:  "Websocket协议切换失败",
+			Link: "/",
+			Btn:  "返回首页",
 		}, true)
 		return
 	}
 	defer conn.Close()
 	count := 0
 	for {
-		singleton.SortedServerLock.RLock()
-		err = conn.WriteJSON(Data{
-			Now:     time.Now().Unix() * 1000,
-			Servers: singleton.SortedServerList,
-		})
-		singleton.SortedServerLock.RUnlock()
+		stat, err := cp.getServerStat()
 		if err != nil {
+			continue
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, stat); err != nil {
 			break
 		}
 		count += 1
@@ -238,13 +278,28 @@ func (cp *commonPage) terminal(c *gin.Context) {
 			}, true)
 			return
 		}
-
-		terminalData, _ := json.Marshal(&model.TerminalTask{
+		cloudflareCookies, _ := c.Cookie("CF_Authorization")
+		// CloudflareCookies合法性验证
+		// 其应该包含.分隔的三组BASE64-URL编码
+		if cloudflareCookies != "" {
+			encodedCookies := strings.Split(cloudflareCookies, ".")
+			if len(encodedCookies) == 3 {
+				for i := 0; i < 3; i++ {
+					if valid, _ := regexp.MatchString("^[A-Za-z0-9-_]+$", encodedCookies[i]); !valid {
+						cloudflareCookies = ""
+						break
+					}
+				}
+			} else {
+				cloudflareCookies = ""
+			}
+		}
+		terminalData, _ := utils.Json.Marshal(&model.TerminalTask{
 			Host:    terminal.host,
 			UseSSL:  terminal.useSSL,
 			Session: terminalID,
+			Cookie:  cloudflareCookies,
 		})
-
 		if err := server.TaskStream.Send(&proto.Task{
 			Type: model.TaskTypeTerminal,
 			Data: string(terminalData),
@@ -263,18 +318,20 @@ func (cp *commonPage) terminal(c *gin.Context) {
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		mygin.ShowErrorPage(c, mygin.ErrInfo{
-			Code:  http.StatusInternalServerError,
-			Title: "网络错误",
-			Msg:   "Websocket协议切换失败",
-			Link:  "/",
-			Btn:   "返回首页",
+			Code: http.StatusInternalServerError,
+			Title: singleton.Localizer.MustLocalize(&i18n.LocalizeConfig{
+				MessageID: "NetworkError",
+			}),
+			Msg:  "Websocket协议切换失败",
+			Link: "/",
+			Btn:  "返回首页",
 		}, true)
 		return
 	}
 	defer conn.Close()
 
-	log.Println("NG>> terminal connected", isAgent, c.Request.URL)
-	defer log.Println("NG>> terminal disconnected", isAgent, c.Request.URL)
+	log.Printf("NG>> terminal connected %t %q", isAgent, c.Request.URL)
+	defer log.Printf("NG>> terminal disconnected %t %q", isAgent, c.Request.URL)
 
 	if isAgent {
 		terminal.agentConn = conn
@@ -398,11 +455,13 @@ func (cp *commonPage) createTerminal(c *gin.Context) {
 	id, err := uuid.GenerateUUID()
 	if err != nil {
 		mygin.ShowErrorPage(c, mygin.ErrInfo{
-			Code:  http.StatusInternalServerError,
-			Title: "系统错误",
-			Msg:   "生成会话ID失败",
-			Link:  "/server",
-			Btn:   "返回重试",
+			Code: http.StatusInternalServerError,
+			Title: singleton.Localizer.MustLocalize(&i18n.LocalizeConfig{
+				MessageID: "SystemError",
+			}),
+			Msg:  "生成会话ID失败",
+			Link: "/server",
+			Btn:  "返回重试",
 		}, true)
 		return
 	}

@@ -5,23 +5,39 @@ import (
 	"time"
 
 	"github.com/google/go-github/github"
+	"github.com/xanzy/go-gitlab"
 
 	"github.com/xos/probe/pkg/utils"
 )
 
 type User struct {
 	Common
-	Login     string `gorm:"UNIQUE_INDEX" json:"login,omitempty"` // 登录名
-	AvatarURL string `json:"avatar_url,omitempty"`                // 头像地址
-	Name      string `json:"name,omitempty"`                      // 昵称
-	Blog      string `json:"blog,omitempty"`                      // 网站链接
-	Email     string `json:"email,omitempty"`                     // 邮箱
+	Login     string `json:"login,omitempty"`      // 登录名
+	AvatarURL string `json:"avatar_url,omitempty"` // 头像地址
+	Name      string `json:"name,omitempty"`       // 昵称
+	Blog      string `json:"blog,omitempty"`       // 网站链接
+	Email     string `json:"email,omitempty"`      // 邮箱
 	Hireable  bool   `json:"hireable,omitempty"`
 	Bio       string `json:"bio,omitempty"` // 个人简介
 
-	Token        string    `gorm:"UNIQUE_INDEX" json:"-"`   // 认证 Token
+	Token        string    `json:"-"`                       // 认证 Token
 	TokenExpired time.Time `json:"token_expired,omitempty"` // Token 过期时间
 	SuperAdmin   bool      `json:"super_admin,omitempty"`   // 超级管理员
+}
+
+func NewUserFromGitlab(gu *gitlab.User) User {
+	var u User
+	u.ID = uint64(gu.ID)
+	u.Login = gu.Username
+	u.AvatarURL = gu.AvatarURL
+	u.Name = gu.Name
+	if u.Name == "" {
+		u.Name = u.Login
+	}
+	u.Blog = gu.WebsiteURL
+	u.Email = gu.Email
+	u.Bio = gu.Bio
+	return u
 }
 
 func NewUserFromGitHub(gu *github.User) User {
@@ -34,7 +50,6 @@ func NewUserFromGitHub(gu *github.User) User {
 	if u.Name == "" {
 		u.Name = u.Login
 	}
-	u.Blog = gu.GetBlog()
 	u.Blog = gu.GetBlog()
 	u.Email = gu.GetEmail()
 	u.Hireable = gu.GetHireable()

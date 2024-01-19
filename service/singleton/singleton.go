@@ -1,91 +1,148 @@
 package singleton
 
 import (
-	"fmt"
-	"sort"
-	"sync"
+	"log"
+	"time"
 
 	"github.com/patrickmn/go-cache"
-	"github.com/robfig/cron/v3"
+	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 
 	"github.com/xos/probe/model"
 	"github.com/xos/probe/pkg/utils"
-	pb "github.com/xos/probe/proto"
 )
 
-var Version = "v2.6.5"
+var Version = "v2.10.5"
 
 var (
 	Conf  *model.Config
 	Cache *cache.Cache
 	DB    *gorm.DB
-
-	ServerList map[uint64]*model.Server
-	SecretToID map[string]uint64
-	ServerLock sync.RWMutex
-
-	SortedServerList []*model.Server
-	SortedServerLock sync.RWMutex
+	Loc   *time.Location
 )
 
-func ReSortServer() {
-	ServerLock.RLock()
-	defer ServerLock.RUnlock()
-	SortedServerLock.Lock()
-	defer SortedServerLock.Unlock()
-
-	SortedServerList = []*model.Server{}
-	for _, s := range ServerList {
-		SortedServerList = append(SortedServerList, s)
+// Init 初始化singleton
+func Init() {
+	// 初始化时区至上海 UTF+8
+	var err error
+	Loc, err = time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		panic(err)
 	}
 
-	sort.SliceStable(SortedServerList, func(i, j int) bool {
-		if SortedServerList[i].DisplayIndex == SortedServerList[j].DisplayIndex {
-			return SortedServerList[i].ID < SortedServerList[j].ID
-		}
-		return SortedServerList[i].DisplayIndex > SortedServerList[j].DisplayIndex
+	Cache = cache.New(5*time.Minute, 10*time.Minute)
+}
+
+// LoadSingleton 加载子服务并执行
+func LoadSingleton() {
+	LoadNotifications() // 加载通知服务
+	LoadServers()       // 加载服务器列表
+	LoadCronTasks()     // 加载定时任务
+	LoadAPI()
+}
+
+// InitConfigFromPath 从给出的文件路径中加载配置
+func InitConfigFromPath(path string) {
+	Conf = &model.Config{}
+	err := Conf.Read(path)
+	if err != nil {
+		panic(err)
+	}
+}
+
+// InitDBFromPath 从给出的文件路径中加载数据库
+func InitDBFromPath(path string) {
+	var err error
+	DB, err = gorm.Open(sqlite.Open(path), &gorm.Config{
+		CreateBatchSize: 200,
 	})
-}
-
-// =============== Cron Mixin ===============
-
-var CronLock sync.RWMutex
-var Crons map[uint64]*model.Cron
-var Cron *cron.Cron
-
-func ManualTrigger(c model.Cron) {
-	CronTrigger(c)()
-}
-
-func CronTrigger(cr model.Cron) func() {
-	crIgnoreMap := make(map[uint64]bool)
-	for j := 0; j < len(cr.Servers); j++ {
-		crIgnoreMap[cr.Servers[j]] = true
+	if err != nil {
+		panic(err)
 	}
-	return func() {
-		ServerLock.RLock()
-		defer ServerLock.RUnlock()
-		for _, s := range ServerList {
-			if cr.Cover == model.CronCoverAll && crIgnoreMap[s.ID] {
+	if Conf.Debug {
+		DB = DB.Debug()
+	}
+	err = DB.AutoMigrate(model.Server{}, model.User{},
+		model.Notification{}, model.AlertRule{}, model.Monitor{},
+		model.MonitorHistory{}, model.Cron{}, model.Transfer{}, model.ApiToken{})
+	if err != nil {
+		panic(err)
+	}
+}
+
+// RecordTransferHourlyUsage 对流量记录进行打点
+func RecordTransferHourlyUsage() {
+	ServerLock.Lock()
+	defer ServerLock.Unlock()
+	now := time.Now()
+	nowTrimSeconds := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, time.Local)
+	var txs []model.Transfer
+	for id, server := range ServerList {
+		tx := model.Transfer{
+			ServerID: id,
+			In:       server.State.NetInTransfer - uint64(server.PrevHourlyTransferIn),
+			Out:      server.State.NetOutTransfer - uint64(server.PrevHourlyTransferOut),
+		}
+		if tx.In == 0 && tx.Out == 0 {
+			continue
+		}
+		server.PrevHourlyTransferIn = int64(server.State.NetInTransfer)
+		server.PrevHourlyTransferOut = int64(server.State.NetOutTransfer)
+		tx.CreatedAt = nowTrimSeconds
+		txs = append(txs, tx)
+	}
+	if len(txs) == 0 {
+		return
+	}
+	log.Println("NG>> Cron 流量统计入库", len(txs), DB.Create(txs).Error)
+}
+
+// CleanMonitorHistory 清理无效或过时的 监控记录 和 流量记录
+func CleanMonitorHistory() {
+	// 清理已被删除的服务器的监控记录与流量记录
+	DB.Unscoped().Delete(&model.MonitorHistory{}, "created_at < ? OR monitor_id NOT IN (SELECT `id` FROM monitors)", time.Now().AddDate(0, 0, -30))
+	DB.Unscoped().Delete(&model.Transfer{}, "server_id NOT IN (SELECT `id` FROM servers)")
+	// 计算可清理流量记录的时长
+	var allServerKeep time.Time
+	specialServerKeep := make(map[uint64]time.Time)
+	var specialServerIDs []uint64
+	var alerts []model.AlertRule
+	DB.Find(&alerts)
+	for _, alert := range alerts {
+		for _, rule := range alert.Rules {
+			// 是不是流量记录规则
+			if !rule.IsTransferDurationRule() {
 				continue
 			}
-			if cr.Cover == model.CronCoverIgnoreAll && !crIgnoreMap[s.ID] {
-				continue
-			}
-			if s.TaskStream != nil {
-				s.TaskStream.Send(&pb.Task{
-					Id:   cr.ID,
-					Data: cr.Command,
-					Type: model.TaskTypeCommand,
-				})
+			dataCouldRemoveBefore := rule.GetTransferDurationStart()
+			// 判断规则影响的机器范围
+			if rule.Cover == model.RuleCoverAll {
+				// 更新全局可以清理的数据点
+				if allServerKeep.IsZero() || allServerKeep.After(dataCouldRemoveBefore) {
+					allServerKeep = dataCouldRemoveBefore
+				}
 			} else {
-				SendNotification(fmt.Sprintf("#探针通知" + "\n" + "[任务失败]：%s" + "\n" + "服务器：%s 离线，无法执行。", cr.Name, s.Name), false)
+				// 更新特定机器可以清理数据点
+				for id := range rule.Ignore {
+					if specialServerKeep[id].IsZero() || specialServerKeep[id].After(dataCouldRemoveBefore) {
+						specialServerKeep[id] = dataCouldRemoveBefore
+						specialServerIDs = append(specialServerIDs, id)
+					}
+				}
 			}
 		}
 	}
+	for id, couldRemove := range specialServerKeep {
+		DB.Unscoped().Delete(&model.Transfer{}, "server_id = ? AND created_at < ?", id, couldRemove)
+	}
+	if allServerKeep.IsZero() {
+		DB.Unscoped().Delete(&model.Transfer{}, "server_id NOT IN (?)", specialServerIDs)
+	} else {
+		DB.Unscoped().Delete(&model.Transfer{}, "server_id NOT IN (?) AND created_at < ?", specialServerIDs, allServerKeep)
+	}
 }
 
+// IPDesensitize 根据设置选择是否对IP进行打码处理 返回处理后的IP(关闭打码则返回原IP)
 func IPDesensitize(ip string) string {
 	if Conf.EnablePlainIPInNotification {
 		return ip

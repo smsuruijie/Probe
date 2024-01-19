@@ -1,9 +1,9 @@
 package model
 
 import (
-	"encoding/json"
 	"time"
 
+	"github.com/xos/probe/pkg/utils"
 	"gorm.io/gorm"
 )
 
@@ -20,14 +20,15 @@ type CycleTransferStats struct {
 
 type AlertRule struct {
 	Common
-	Name     string
-	RulesRaw string
-	Enable   *bool
-	Rules    []Rule `gorm:"-" json:"-"`
+	Name            string
+	RulesRaw        string
+	Enable          *bool
+	NotificationTag string // 该报警规则所在的通知组
+	Rules           []Rule `gorm:"-" json:"-"`
 }
 
 func (r *AlertRule) BeforeSave(tx *gorm.DB) error {
-	data, err := json.Marshal(r.Rules)
+	data, err := utils.Json.Marshal(r.Rules)
 	if err != nil {
 		return err
 	}
@@ -36,13 +37,14 @@ func (r *AlertRule) BeforeSave(tx *gorm.DB) error {
 }
 
 func (r *AlertRule) AfterFind(tx *gorm.DB) error {
-	return json.Unmarshal([]byte(r.RulesRaw), &r.Rules)
+	return utils.Json.Unmarshal([]byte(r.RulesRaw), &r.Rules)
 }
 
 func (r *AlertRule) Enabled() bool {
 	return r.Enable != nil && *r.Enable
 }
 
+// Snapshot 对传入的Server进行该报警规则下所有type的检查 返回包含每项检查结果的空接口
 func (r *AlertRule) Snapshot(cycleTransferStats *CycleTransferStats, server *Server, db *gorm.DB) []interface{} {
 	var point []interface{}
 	for i := 0; i < len(r.Rules); i++ {
@@ -51,9 +53,10 @@ func (r *AlertRule) Snapshot(cycleTransferStats *CycleTransferStats, server *Ser
 	return point
 }
 
+// Check 传入包含当前报警规则下所有type检查结果的空接口 返回报警持续时间与是否通过报警检查(通过则返回true)
 func (r *AlertRule) Check(points [][]interface{}) (int, bool) {
-	var max int
-	var count int
+	var max int   // 报警持续时间
+	var count int // 检查未通过的个数
 	for i := 0; i < len(r.Rules); i++ {
 		if r.Rules[i].IsTransferDurationRule() {
 			// 循环区间流量报警
@@ -83,11 +86,13 @@ func (r *AlertRule) Check(points [][]interface{}) (int, bool) {
 					fail++
 				}
 			}
+			// 当70%以上的采样点未通过规则判断时 才认为当前检查未通过
 			if fail/total > 0.7 {
 				count++
 				break
 			}
 		}
 	}
+	// 仅当所有检查均未通过时 返回false
 	return max, count != len(r.Rules)
 }

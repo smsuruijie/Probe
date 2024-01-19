@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,17 +10,23 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
+	"github.com/AlecAivazis/survey/v2"
 	"github.com/blang/semver"
 	"github.com/go-ping/ping"
 	"github.com/gorilla/websocket"
 	"github.com/p14yground/go-github-selfupdate/selfupdate"
+	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/host"
+	psnet "github.com/shirou/gopsutil/v3/net"
 	flag "github.com/spf13/pflag"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/xos/probe/cmd/agent/monitor"
 	"github.com/xos/probe/cmd/agent/processgroup"
@@ -32,17 +37,17 @@ import (
 	"github.com/xos/probe/service/rpc"
 )
 
-type AgentConfig struct {
-	SkipConnectionCount   bool
-	SkipProcsCount        bool
-	DisableAutoUpdate     bool
-	DisableForceUpdate    bool
-	DisableCommandExecute bool
-	Debug                 bool
-	Server                string
-	ClientSecret          string
-	ReportDelay           int
-	TLS                   bool
+type AgentCliParam struct {
+	SkipConnectionCount   bool   // 跳过连接数检查
+	SkipProcsCount        bool   // 跳过进程数量检查
+	DisableAutoUpdate     bool   // 关闭自动更新
+	DisableForceUpdate    bool   // 关闭强制更新
+	DisableCommandExecute bool   // 关闭命令执行
+	Debug                 bool   // debug模式
+	Server                string // 服务器地址
+	ClientSecret          string // 客户端密钥
+	ReportDelay           int    // 报告间隔
+	TLS                   bool   // 是否使用TLS加密传输至服务端
 }
 
 var (
@@ -53,9 +58,9 @@ var (
 )
 
 var (
-	agentConf  AgentConfig
-	updateCh   = make(chan struct{}) // Agent 自动更新间隔
-	httpClient = &http.Client{
+	agentCliParam AgentCliParam
+	agentConfig   model.AgentConfig
+	httpClient    = &http.Client{
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
@@ -71,9 +76,16 @@ const (
 func init() {
 	http.DefaultClient.Timeout = time.Second * 5
 	flag.CommandLine.ParseErrorsWhitelist.UnknownFlags = true
+
+	ex, err := os.Executable()
+	if err != nil {
+		panic(err)
+	}
+	agentConfig.Read(filepath.Dir(ex) + "/config.yml")
 }
 
 func main() {
+	// windows环境处理
 	if runtime.GOOS == "windows" {
 		hostArch, err := host.KernelArch()
 		if err != nil {
@@ -96,24 +108,32 @@ func main() {
 	// 来自于 GoReleaser 的版本号
 	monitor.Version = version
 
-	flag.BoolVarP(&agentConf.Debug, "debug", "d", true, "开启调试信息")
-	flag.StringVarP(&agentConf.Server, "server", "s", "localhost:2222", "管理面板RPC端口")
-	flag.StringVarP(&agentConf.ClientSecret, "password", "p", "", "Agent连接Secret")
-	flag.IntVar(&agentConf.ReportDelay, "report-delay", 1, "系统状态上报间隔")
-	flag.BoolVar(&agentConf.SkipConnectionCount, "skip-conn", false, "不监控连接数")
-	flag.BoolVar(&agentConf.SkipProcsCount, "skip-procs", false, "不监控进程数")
-	flag.BoolVar(&agentConf.DisableCommandExecute, "disable-command-execute", false, "禁止在此机器上执行命令")
-	flag.BoolVar(&agentConf.DisableAutoUpdate, "disable-auto-update", false, "禁用自动升级")
-	flag.BoolVar(&agentConf.DisableForceUpdate, "disable-force-update", false, "禁用强制升级")
-	flag.BoolVar(&agentConf.TLS, "tls", false, "启用SSL/TLS加密")
+	// 初始化运行参数
+	var isEditAgentConfig bool
+	flag.BoolVarP(&agentCliParam.Debug, "debug", "d", true, "开启调试信息")
+	flag.BoolVarP(&isEditAgentConfig, "edit-agent-config", "", false, "修改要监控的网卡/分区白名单")
+	flag.StringVarP(&agentCliParam.Server, "server", "s", "localhost:2222", "管理面板RPC端口")
+	flag.StringVarP(&agentCliParam.ClientSecret, "password", "p", "", "探针连接密钥")
+	flag.IntVar(&agentCliParam.ReportDelay, "report-delay", 1, "系统状态上报间隔")
+	flag.BoolVar(&agentCliParam.SkipConnectionCount, "skip-conn", false, "不监控连接数")
+	flag.BoolVar(&agentCliParam.SkipProcsCount, "skip-procs", false, "不监控进程数")
+	flag.BoolVar(&agentCliParam.DisableCommandExecute, "disable-command-execute", false, "禁止在此机器上执行命令")
+	flag.BoolVar(&agentCliParam.DisableAutoUpdate, "disable-auto-update", false, "禁用自动升级")
+	flag.BoolVar(&agentCliParam.DisableForceUpdate, "disable-force-update", false, "禁用强制升级")
+	flag.BoolVar(&agentCliParam.TLS, "tls", false, "启用SSL/TLS加密")
 	flag.Parse()
 
-	if agentConf.ClientSecret == "" {
+	if isEditAgentConfig {
+		editAgentConfig()
+		return
+	}
+
+	if agentCliParam.ClientSecret == "" {
 		flag.Usage()
 		return
 	}
 
-	if agentConf.ReportDelay < 1 || agentConf.ReportDelay > 4 {
+	if agentCliParam.ReportDelay < 1 || agentCliParam.ReportDelay > 4 {
 		println("report-delay 的区间为 1-4")
 		return
 	}
@@ -123,10 +143,11 @@ func main() {
 
 func run() {
 	auth := rpc.AuthHandler{
-		ClientSecret: agentConf.ClientSecret,
+		ClientSecret: agentCliParam.ClientSecret,
 	}
 
-	if !agentConf.DisableCommandExecute {
+	// 下载远程命令执行需要的终端
+	if !agentCliParam.DisableCommandExecute {
 		go pty.DownloadDependency()
 	}
 	// 上报服务器信息
@@ -134,19 +155,14 @@ func run() {
 	// 更新IP信息
 	go monitor.UpdateIP()
 
-	if _, err := semver.Parse(version); err == nil && !agentConf.DisableAutoUpdate {
+	// 定时检查更新
+	if _, err := semver.Parse(version); err == nil && !agentCliParam.DisableAutoUpdate {
+		doSelfUpdate(true)
 		go func() {
-			for range updateCh {
-				go func() {
-					defer func() {
-						time.Sleep(time.Minute * 20)
-						updateCh <- struct{}{}
-					}()
-					doSelfUpdate(true)
-				}()
+			for range time.Tick(30 * time.Minute) {
+				doSelfUpdate(true)
 			}
 		}()
-		updateCh <- struct{}{}
 	}
 
 	var err error
@@ -165,12 +181,12 @@ func run() {
 	for {
 		timeOutCtx, cancel := context.WithTimeout(context.Background(), networkTimeOut)
 		var securityOption grpc.DialOption
-		if agentConf.TLS {
+		if agentCliParam.TLS {
 			securityOption = grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12}))
 		} else {
-			securityOption = grpc.WithInsecure()
+			securityOption = grpc.WithTransportCredentials(insecure.NewCredentials())
 		}
-		conn, err = grpc.DialContext(timeOutCtx, agentConf.Server, securityOption, grpc.WithPerRPCCredentials(&auth))
+		conn, err = grpc.DialContext(timeOutCtx, agentCliParam.Server, securityOption, grpc.WithPerRPCCredentials(&auth))
 		if err != nil {
 			println("与面板建立连接失败：", err)
 			cancel()
@@ -181,7 +197,7 @@ func run() {
 		client = pb.NewProbeServiceClient(conn)
 		// 第一步注册
 		timeOutCtx, cancel = context.WithTimeout(context.Background(), networkTimeOut)
-		_, err = client.ReportSystemInfo(timeOutCtx, monitor.GetHost().PB())
+		_, err = client.ReportSystemInfo(timeOutCtx, monitor.GetHost(&agentConfig).PB())
 		if err != nil {
 			println("上报系统信息失败：", err)
 			cancel()
@@ -191,7 +207,7 @@ func run() {
 		cancel()
 		inited = true
 		// 执行 Task
-		tasks, err := client.RequestTask(context.Background(), monitor.GetHost().PB())
+		tasks, err := client.RequestTask(context.Background(), monitor.GetHost(&agentConfig).PB())
 		if err != nil {
 			println("请求任务失败：", err)
 			retry()
@@ -248,6 +264,7 @@ func doTask(task *pb.Task) {
 	client.ReportTask(context.Background(), &result)
 }
 
+// reportState 向server上报状态信息
 func reportState() {
 	var lastReportHostInfo time.Time
 	var err error
@@ -255,23 +272,25 @@ func reportState() {
 	for {
 		// 为了更准确的记录时段流量，inited 后再上传状态信息
 		if client != nil && inited {
-			monitor.TrackNetworkSpeed()
+			monitor.TrackNetworkSpeed(&agentConfig)
 			timeOutCtx, cancel := context.WithTimeout(context.Background(), networkTimeOut)
-			_, err = client.ReportSystemState(timeOutCtx, monitor.GetState(agentConf.SkipConnectionCount, agentConf.SkipProcsCount).PB())
+			_, err = client.ReportSystemState(timeOutCtx, monitor.GetState(&agentConfig, agentCliParam.SkipConnectionCount, agentCliParam.SkipProcsCount).PB())
 			cancel()
 			if err != nil {
 				println("reportState error", err)
 				time.Sleep(delayWhenError)
 			}
+			// 每10分钟重新获取一次硬件信息
 			if lastReportHostInfo.Before(time.Now().Add(-10 * time.Minute)) {
 				lastReportHostInfo = time.Now()
-				client.ReportSystemInfo(context.Background(), monitor.GetHost().PB())
+				client.ReportSystemInfo(context.Background(), monitor.GetHost(&agentConfig).PB())
 			}
 		}
-		time.Sleep(time.Second * time.Duration(agentConf.ReportDelay))
+		time.Sleep(time.Second * time.Duration(agentCliParam.ReportDelay))
 	}
 }
 
+// doSelfUpdate 执行更新检查 如果更新成功则会结束进程
 func doSelfUpdate(useLocalVersion bool) {
 	v := semver.MustParse("0.1.0")
 	if useLocalVersion {
@@ -284,12 +303,13 @@ func doSelfUpdate(useLocalVersion bool) {
 		return
 	}
 	if !latest.Version.Equals(v) {
+		println("已经更新至：", latest.Version, " 正在结束进程")
 		os.Exit(1)
 	}
 }
 
 func handleUpgradeTask(task *pb.Task, result *pb.TaskResult) {
-	if agentConf.DisableForceUpdate {
+	if agentCliParam.DisableForceUpdate {
 		return
 	}
 	doSelfUpdate(false)
@@ -348,8 +368,8 @@ func handleHttpGetTask(task *pb.Task, result *pb.TaskResult) {
 }
 
 func handleCommandTask(task *pb.Task, result *pb.TaskResult) {
-	if agentConf.DisableCommandExecute {
-		result.Data = "此 Agent 已禁止命令执行"
+	if agentCliParam.DisableCommandExecute {
+		result.Data = "该节点已禁止命令执行"
 		return
 	}
 	startedAt := time.Now()
@@ -397,12 +417,12 @@ type WindowSize struct {
 }
 
 func handleTerminalTask(task *pb.Task) {
-	if agentConf.DisableCommandExecute {
-		println("此 Agent 已禁止命令执行")
+	if agentCliParam.DisableCommandExecute {
+		println("该节点已禁止命令执行")
 		return
 	}
 	var terminal model.TerminalTask
-	err := json.Unmarshal([]byte(task.GetData()), &terminal)
+	err := utils.Json.Unmarshal([]byte(task.GetData()), &terminal)
 	if err != nil {
 		println("Terminal 任务解析错误：", err)
 		return
@@ -412,7 +432,13 @@ func handleTerminalTask(task *pb.Task) {
 		protocol += "s"
 	}
 	header := http.Header{}
-	header.Add("Secret", agentConf.ClientSecret)
+	header.Add("Secret", agentCliParam.ClientSecret)
+	// 目前只兼容Cloudflare验证
+	// 后续可能需要兼容更多的Cookie验证情况
+	if terminal.Cookie != "" {
+		cfCookie := fmt.Sprintf("CF_Authorization=%s", terminal.Cookie)
+		header.Add("Cookie", cfCookie)
+	}
 	conn, _, err := websocket.DefaultDialer.Dial(fmt.Sprintf("%s://%s/terminal/%s", protocol, terminal.Host, terminal.Session), header)
 	if err != nil {
 		println("Terminal 连接失败：", err)
@@ -470,7 +496,7 @@ func handleTerminalTask(task *pb.Task) {
 		case 0:
 			io.Copy(tty, reader)
 		case 1:
-			decoder := json.NewDecoder(reader)
+			decoder := utils.Json.NewDecoder(reader)
 			var resizeMessage WindowSize
 			err := decoder.Decode(&resizeMessage)
 			if err != nil {
@@ -481,8 +507,73 @@ func handleTerminalTask(task *pb.Task) {
 	}
 }
 
+// 修改Agent要监控的网卡与硬盘分区
+func editAgentConfig() {
+	nc, err := psnet.IOCounters(true)
+	if err != nil {
+		panic(err)
+	}
+	var nicAllowlistOptions []string
+	for _, v := range nc {
+		nicAllowlistOptions = append(nicAllowlistOptions, v.Name)
+	}
+
+	var diskAllowlistOptions []string
+	diskList, err := disk.Partitions(false)
+	if err != nil {
+		panic(err)
+	}
+	for _, p := range diskList {
+		diskAllowlistOptions = append(diskAllowlistOptions, fmt.Sprintf("%s\t%s\t%s", p.Mountpoint, p.Fstype, p.Device))
+	}
+
+	var qs = []*survey.Question{
+		{
+			Name: "nic",
+			Prompt: &survey.MultiSelect{
+				Message: "选择要监控的网卡",
+				Options: nicAllowlistOptions,
+			},
+		},
+		{
+			Name: "disk",
+			Prompt: &survey.MultiSelect{
+				Message: "选择要监控的硬盘分区",
+				Options: diskAllowlistOptions,
+			},
+		},
+	}
+
+	answers := struct {
+		Nic  []string
+		Disk []string
+	}{}
+
+	err = survey.Ask(qs, &answers, survey.WithValidator(survey.Required))
+	if err != nil {
+		fmt.Println("选择错误", err.Error())
+		return
+	}
+
+	agentConfig.HardDrivePartitionAllowlist = []string{}
+	for _, v := range answers.Disk {
+		agentConfig.HardDrivePartitionAllowlist = append(agentConfig.HardDrivePartitionAllowlist, strings.Split(v, "\t")[0])
+	}
+
+	agentConfig.NICAllowlist = make(map[string]bool)
+	for _, v := range answers.Nic {
+		agentConfig.NICAllowlist[v] = true
+	}
+
+	if err = agentConfig.Save(); err != nil {
+		panic(err)
+	}
+
+	fmt.Println("修改自定义配置成功，重启探针后生效")
+}
+
 func println(v ...interface{}) {
-	if agentConf.Debug {
+	if agentCliParam.Debug {
 		fmt.Printf("NG@%s>> ", time.Now().Format("2006-01-02 15:04:05"))
 		fmt.Println(v...)
 	}

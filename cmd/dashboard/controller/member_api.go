@@ -2,7 +2,6 @@ package controller
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -44,6 +43,120 @@ func (ma *memberAPI) serve() {
 	mr.POST("/setting", ma.updateSetting)
 	mr.DELETE("/:model/:id", ma.delete)
 	mr.POST("/logout", ma.logout)
+	mr.GET("/token", ma.getToken)
+	mr.POST("/token", ma.issueNewToken)
+	mr.DELETE("/token/:token", ma.deleteToken)
+
+	// API
+	v1 := ma.r.Group("v1")
+	{
+		apiv1 := &apiV1{v1}
+		apiv1.serve()
+	}
+}
+
+type apiResult struct {
+	Token string `json:"token"`
+	Note  string `json:"note"`
+}
+
+// getToken 获取 Token
+func (ma *memberAPI) getToken(c *gin.Context) {
+	u := c.MustGet(model.CtxKeyAuthorizedUser).(*model.User)
+	singleton.ApiLock.RLock()
+	defer singleton.ApiLock.RUnlock()
+
+	tokenList := singleton.UserIDToApiTokenList[u.ID]
+	res := make([]*apiResult, len(tokenList))
+	for i, token := range tokenList {
+		res[i] = &apiResult{
+			Token: token,
+			Note:  singleton.ApiTokenList[token].Note,
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"code":    0,
+		"message": "success",
+		"result":  res,
+	})
+}
+
+type TokenForm struct {
+	Note string
+}
+
+// issueNewToken 生成新的 token
+func (ma *memberAPI) issueNewToken(c *gin.Context) {
+	u := c.MustGet(model.CtxKeyAuthorizedUser).(*model.User)
+	tf := &TokenForm{}
+	err := c.ShouldBindJSON(tf)
+	if err != nil {
+		c.JSON(http.StatusOK, model.Response{
+			Code:    http.StatusBadRequest,
+			Message: fmt.Sprintf("请求错误：%s", err),
+		})
+		return
+	}
+	token := &model.ApiToken{
+		UserID: u.ID,
+		Token:  utils.MD5(fmt.Sprintf("%d%d%s", time.Now().UnixNano(), u.ID, u.Login)),
+		Note:   tf.Note,
+	}
+	singleton.DB.Create(token)
+
+	singleton.ApiLock.Lock()
+	singleton.ApiTokenList[token.Token] = token
+	singleton.UserIDToApiTokenList[u.ID] = append(singleton.UserIDToApiTokenList[u.ID], token.Token)
+	singleton.ApiLock.Unlock()
+
+	c.JSON(http.StatusOK, model.Response{
+		Code:    http.StatusOK,
+		Message: "success",
+		Result: map[string]string{
+			"token": token.Token,
+			"note":  token.Note,
+		},
+	})
+}
+
+// deleteToken 删除 token
+func (ma *memberAPI) deleteToken(c *gin.Context) {
+	token := c.Param("token")
+	if token == "" {
+		c.JSON(http.StatusOK, model.Response{
+			Code:    http.StatusBadRequest,
+			Message: "token 不能为空",
+		})
+		return
+	}
+	singleton.ApiLock.Lock()
+	defer singleton.ApiLock.Unlock()
+	if _, ok := singleton.ApiTokenList[token]; !ok {
+		c.JSON(http.StatusOK, model.Response{
+			Code:    http.StatusBadRequest,
+			Message: "token 不存在",
+		})
+		return
+	}
+	// 在数据库中删除该Token
+	singleton.DB.Unscoped().Delete(&model.ApiToken{}, "token = ?", token)
+
+	// 在UserIDToApiTokenList中删除该Token
+	for i, t := range singleton.UserIDToApiTokenList[singleton.ApiTokenList[token].UserID] {
+		if t == token {
+			singleton.UserIDToApiTokenList[singleton.ApiTokenList[token].UserID] = append(singleton.UserIDToApiTokenList[singleton.ApiTokenList[token].UserID][:i], singleton.UserIDToApiTokenList[singleton.ApiTokenList[token].UserID][i+1:]...)
+			break
+		}
+	}
+	if len(singleton.UserIDToApiTokenList[singleton.ApiTokenList[token].UserID]) == 0 {
+		delete(singleton.UserIDToApiTokenList, singleton.ApiTokenList[token].UserID)
+	}
+	// 在ApiTokenList中删除该Token
+	delete(singleton.ApiTokenList, token)
+	c.JSON(http.StatusOK, model.Response{
+		Code:    http.StatusOK,
+		Message: "success",
+	})
 }
 
 func (ma *memberAPI) delete(c *gin.Context) {
@@ -63,8 +176,23 @@ func (ma *memberAPI) delete(c *gin.Context) {
 		if err == nil {
 			// 删除服务器
 			singleton.ServerLock.Lock()
+			tag := singleton.ServerList[id].Tag
 			delete(singleton.SecretToID, singleton.ServerList[id].Secret)
 			delete(singleton.ServerList, id)
+			index := -1
+			for i := 0; i < len(singleton.ServerTagToIDList[tag]); i++ {
+				if singleton.ServerTagToIDList[tag][i] == id {
+					index = i
+					break
+				}
+			}
+			if index > -1 {
+				// 删除旧 Tag-ID 绑定关系
+				singleton.ServerTagToIDList[tag] = append(singleton.ServerTagToIDList[tag][:index], singleton.ServerTagToIDList[tag][index+1:]...)
+				if len(singleton.ServerTagToIDList[tag]) == 0 {
+					delete(singleton.ServerTagToIDList, tag)
+				}
+			}
 			singleton.ServerLock.Unlock()
 			singleton.ReSortServer()
 			// 删除循环流量状态中的此服务器相关的记录
@@ -195,6 +323,25 @@ func (ma *memberAPI) addOrEditServer(c *gin.Context) {
 			// 设置新的 Secret-ID 绑定关系
 			delete(singleton.SecretToID, singleton.ServerList[s.ID].Secret)
 		}
+		// 如果修改了Tag
+		if s.Tag != singleton.ServerList[s.ID].Tag {
+			index := -1
+			for i := 0; i < len(singleton.ServerTagToIDList[s.Tag]); i++ {
+				if singleton.ServerTagToIDList[s.Tag][i] == s.ID {
+					index = i
+					break
+				}
+			}
+			if index > -1 {
+				// 删除旧 Tag-ID 绑定关系
+				singleton.ServerTagToIDList[singleton.ServerList[s.ID].Tag] = append(singleton.ServerTagToIDList[singleton.ServerList[s.ID].Tag][:index], singleton.ServerTagToIDList[singleton.ServerList[s.ID].Tag][index+1:]...)
+			}
+			// 设置新的 Tag-ID 绑定关系
+			singleton.ServerTagToIDList[s.Tag] = append(singleton.ServerTagToIDList[s.Tag], s.ID)
+			if len(singleton.ServerTagToIDList[s.Tag]) == 0 {
+				delete(singleton.ServerTagToIDList, s.Tag)
+			}
+		}
 		singleton.ServerList[s.ID] = &s
 		singleton.ServerLock.Unlock()
 	} else {
@@ -203,6 +350,7 @@ func (ma *memberAPI) addOrEditServer(c *gin.Context) {
 		singleton.ServerLock.Lock()
 		singleton.SecretToID[s.Secret] = s.ID
 		singleton.ServerList[s.ID] = &s
+		singleton.ServerTagToIDList[s.Tag] = append(singleton.ServerTagToIDList[s.Tag], s.ID)
 		singleton.ServerLock.Unlock()
 	}
 	singleton.ReSortServer()
@@ -212,14 +360,15 @@ func (ma *memberAPI) addOrEditServer(c *gin.Context) {
 }
 
 type monitorForm struct {
-	ID             uint64
-	Name           string
-	Target         string
-	Type           uint8
-	Cover          uint8
-	Notify         string
-	SkipServersRaw string
-	Duration       uint64
+	ID              uint64
+	Name            string
+	Target          string
+	Type            uint8
+	Cover           uint8
+	Notify          string
+	NotificationTag string
+	SkipServersRaw  string
+	Duration        uint64
 }
 
 func (ma *memberAPI) addOrEditMonitor(c *gin.Context) {
@@ -234,10 +383,15 @@ func (ma *memberAPI) addOrEditMonitor(c *gin.Context) {
 		m.SkipServersRaw = mf.SkipServersRaw
 		m.Cover = mf.Cover
 		m.Notify = mf.Notify == "on"
+		m.NotificationTag = mf.NotificationTag
 		m.Duration = mf.Duration
 		err = m.InitSkipServers()
 	}
 	if err == nil {
+		// 保证NotificationTag不为空
+		if m.NotificationTag == "" {
+			m.NotificationTag = "default"
+		}
 		if m.ID == 0 {
 			err = singleton.DB.Create(&m).Error
 		} else {
@@ -260,13 +414,14 @@ func (ma *memberAPI) addOrEditMonitor(c *gin.Context) {
 }
 
 type cronForm struct {
-	ID             uint64
-	Name           string
-	Scheduler      string
-	Command        string
-	ServersRaw     string
-	Cover          uint8
-	PushSuccessful string
+	ID              uint64
+	Name            string
+	Scheduler       string
+	Command         string
+	ServersRaw      string
+	Cover           uint8
+	PushSuccessful  string
+	NotificationTag string
 }
 
 func (ma *memberAPI) addOrEditCron(c *gin.Context) {
@@ -279,12 +434,17 @@ func (ma *memberAPI) addOrEditCron(c *gin.Context) {
 		cr.Command = cf.Command
 		cr.ServersRaw = cf.ServersRaw
 		cr.PushSuccessful = cf.PushSuccessful == "on"
+		cr.NotificationTag = cf.NotificationTag
 		cr.ID = cf.ID
 		cr.Cover = cf.Cover
-		err = json.Unmarshal([]byte(cf.ServersRaw), &cr.Servers)
+		err = utils.Json.Unmarshal([]byte(cf.ServersRaw), &cr.Servers)
 	}
 	tx := singleton.DB.Begin()
 	if err == nil {
+		// 保证NotificationTag不为空
+		if cr.NotificationTag == "" {
+			cr.NotificationTag = "default"
+		}
 		if cf.ID == 0 {
 			err = tx.Create(&cr).Error
 		} else {
@@ -377,12 +537,14 @@ func (ma *memberAPI) forceUpdate(c *gin.Context) {
 type notificationForm struct {
 	ID            uint64
 	Name          string
+	Tag           string // 分组名
 	URL           string
 	RequestMethod int
 	RequestType   int
 	RequestHeader string
 	RequestBody   string
 	VerifySSL     string
+	SkipCheck     string
 }
 
 func (ma *memberAPI) addOrEditNotification(c *gin.Context) {
@@ -391,6 +553,7 @@ func (ma *memberAPI) addOrEditNotification(c *gin.Context) {
 	err := c.ShouldBindJSON(&nf)
 	if err == nil {
 		n.Name = nf.Name
+		n.Tag = nf.Tag
 		n.RequestMethod = nf.RequestMethod
 		n.RequestType = nf.RequestType
 		n.RequestHeader = nf.RequestHeader
@@ -399,9 +562,20 @@ func (ma *memberAPI) addOrEditNotification(c *gin.Context) {
 		verifySSL := nf.VerifySSL == "on"
 		n.VerifySSL = &verifySSL
 		n.ID = nf.ID
-		err = n.Send("这是测试消息")
+		ns := model.NotificationServerBundle{
+			Notification: &n,
+			Server:       nil,
+		}
+		// 勾选了跳过检查
+		if nf.SkipCheck != "on" {
+			err = ns.Send("这是测试消息")
+		}
 	}
 	if err == nil {
+		// 保证Tag不为空
+		if n.Tag == "" {
+			n.Tag = "default"
+		}
 		if n.ID == 0 {
 			err = singleton.DB.Create(&n).Error
 		} else {
@@ -415,17 +589,18 @@ func (ma *memberAPI) addOrEditNotification(c *gin.Context) {
 		})
 		return
 	}
-	singleton.OnRefreshOrAddNotification(n)
+	singleton.OnRefreshOrAddNotification(&n)
 	c.JSON(http.StatusOK, model.Response{
 		Code: http.StatusOK,
 	})
 }
 
 type alertRuleForm struct {
-	ID       uint64
-	Name     string
-	RulesRaw string
-	Enable   string
+	ID              uint64
+	Name            string
+	RulesRaw        string
+	NotificationTag string
+	Enable          string
 }
 
 func (ma *memberAPI) addOrEditAlertRule(c *gin.Context) {
@@ -433,16 +608,31 @@ func (ma *memberAPI) addOrEditAlertRule(c *gin.Context) {
 	var r model.AlertRule
 	err := c.ShouldBindJSON(&arf)
 	if err == nil {
-		err = json.Unmarshal([]byte(arf.RulesRaw), &r.Rules)
+		err = utils.Json.Unmarshal([]byte(arf.RulesRaw), &r.Rules)
 	}
 	if err == nil {
 		if len(r.Rules) == 0 {
 			err = errors.New("至少定义一条规则")
 		} else {
 			for i := 0; i < len(r.Rules); i++ {
-				if !r.Rules[i].IsTransferDurationRule() && r.Rules[i].Duration < 3 {
-					err = errors.New("错误：Duration 至少为 3")
-					break
+				if !r.Rules[i].IsTransferDurationRule() {
+					if r.Rules[i].Duration < 3 {
+						err = errors.New("错误：Duration 至少为 3")
+						break
+					}
+				} else {
+					if r.Rules[i].CycleInterval < 1 {
+						err = errors.New("错误: cycle_interval 至少为 1")
+						break
+					}
+					if r.Rules[i].CycleStart == nil {
+						err = errors.New("错误: cycle_start 未设置")
+						break
+					}
+					if r.Rules[i].CycleStart.After(time.Now()) {
+						err = errors.New("错误: cycle_start 是个未来值")
+						break
+					}
 				}
 			}
 		}
@@ -450,9 +640,14 @@ func (ma *memberAPI) addOrEditAlertRule(c *gin.Context) {
 	if err == nil {
 		r.Name = arf.Name
 		r.RulesRaw = arf.RulesRaw
+		r.NotificationTag = arf.NotificationTag
 		enable := arf.Enable == "on"
 		r.Enable = &enable
 		r.ID = arf.ID
+		//保证NotificationTag不为空
+		if r.NotificationTag == "" {
+			r.NotificationTag = "default"
+		}
 		if r.ID == 0 {
 			err = singleton.DB.Create(&r).Error
 		} else {
@@ -503,15 +698,17 @@ func (ma *memberAPI) logout(c *gin.Context) {
 }
 
 type settingForm struct {
-	Title                 string
-	Admin                 string
-	Theme                 string
-	CustomCode            string
-	ViewPassword          string
-	IgnoredIPNotification string
-	GRPCHost              string
-	GRPCPort              uint
-	Cover                 uint8
+	Title                   string
+	Admin                   string
+	Language                string
+	Theme                   string
+	CustomCode              string
+	ViewPassword            string
+	IgnoredIPNotification   string
+	IPChangeNotificationTag string // IP变更提醒的通知组
+	GRPCHost                string
+	GRPCPort                uint
+	Cover                   uint8
 
 	EnableIPChangeNotification  string
 	EnablePlainIPInNotification string
@@ -526,17 +723,30 @@ func (ma *memberAPI) updateSetting(c *gin.Context) {
 		})
 		return
 	}
+	if yes, err := utils.IsTemplateDirEmpty("theme-" + sf.Theme); err != nil || yes {
+		c.JSON(http.StatusOK, model.Response{
+			Code:    http.StatusBadRequest,
+			Message: fmt.Sprintf("前台主题文件异常：%s", err),
+		})
+		return
+	}
+	singleton.Conf.Language = sf.Language
 	singleton.Conf.EnableIPChangeNotification = sf.EnableIPChangeNotification == "on"
 	singleton.Conf.EnablePlainIPInNotification = sf.EnablePlainIPInNotification == "on"
 	singleton.Conf.Cover = sf.Cover
 	singleton.Conf.GRPCHost = sf.GRPCHost
 	singleton.Conf.GRPCPort = sf.GRPCPort
 	singleton.Conf.IgnoredIPNotification = sf.IgnoredIPNotification
+	singleton.Conf.IPChangeNotificationTag = sf.IPChangeNotificationTag
 	singleton.Conf.Site.Brand = sf.Title
 	singleton.Conf.Site.Theme = sf.Theme
 	singleton.Conf.Site.CustomCode = sf.CustomCode
 	singleton.Conf.Site.ViewPassword = sf.ViewPassword
 	singleton.Conf.Oauth2.Admin = sf.Admin
+	// 保证NotificationTag不为空
+	if singleton.Conf.IPChangeNotificationTag == "" {
+		singleton.Conf.IPChangeNotificationTag = "default"
+	}
 	if err := singleton.Conf.Save(); err != nil {
 		c.JSON(http.StatusOK, model.Response{
 			Code:    http.StatusBadRequest,
@@ -544,6 +754,8 @@ func (ma *memberAPI) updateSetting(c *gin.Context) {
 		})
 		return
 	}
+	// 更新系统语言
+	singleton.InitLocalizer()
 	c.JSON(http.StatusOK, model.Response{
 		Code: http.StatusOK,
 	})
